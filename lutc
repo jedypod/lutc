@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import numpy as np
+import imageio as iio
+import argparse
+import logging
+
+
+''' LUTCreate
+    A minimal python tool for generating LUTs from images.
+'''
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(message)s',
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)])
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
+
+
+def get_args():
+    ''' Parse all arguments from commandline and assemble args dict
+    '''
+    parser = argparse.ArgumentParser(description='LUTCreate: a minimal tool to genereate a 1d or 3d lut from an image.')
+
+    parser.add_argument('-s', '--shape',
+                help='Shape of the lut. Comma separated float or int values to specify min,max,size. use "-s=-0.1,1,1024" if negatives. \n If not specified the defaults will be used.',
+                type=str,
+                required=False,
+                )
+
+    parser.add_argument('-f', '--format',
+                help='The LUT format to output. Supported formats: "spi", "cube", "cub"',
+                required=False,
+                )
+
+    parser.add_argument('-c', '--cube',
+                help='Create a cube LUT instead of a 1D LUT.',
+                action="store_true",
+                required=False,
+                )
+
+    parser.add_argument('-i', '--image',
+                help='Source image to process into a LUT.',
+                required=False,
+                )
+    
+    parser.add_argument('-o', '--outdir',
+                help='Output directory for identity images, or lut files [default: current directory]',
+                required=False,
+                )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return None
+
+    # get args
+    args = dict()
+    ap = parser.parse_args()
+
+    args['format'] = ap.format
+    args['cube'] = ap.cube
+    args['image'] = ap.image
+    args['outdir'] = ap.outdir
+    
+    
+    # default shape
+    default_shape = (0.0, 1.0, 33) if args['cube'] else (0.0, 1.0, 4096)
+    args['mn'], args['mx'], args['size'] = default_shape
+    
+    
+    # parse and validate shape string
+    if ',' in ap.shape:
+        _tokens = ap.shape.split(',')
+        if len(_tokens) == 3:
+            args['mn'], args['mx'], args['size'] = ap.shape.split(',')
+        else:
+            log.error('Error: Invalid shape "{0}" - Shape must be int specifying size, or 3 comma separated values specifying min,max,size.'.format(ap.shape))
+            return
+    else:
+        # use defaults for min and max, and assume int given for size
+        args['size'] = ap.shape
+    
+    # coerce to float
+    try:
+        args['mn'] = float(args['mn'])
+        args['mx'] = float(args['mx'])
+        args['size'] = int(args['size'])
+    except ValueError:
+        # print a warning and revert to the default shape
+        log.warning('Error: Invalid shape "{0}" - Can not convert to float. Will use default values.'.format(ap.shape))
+        args['mn'], args['mx'], args['size'] = default_shape
+        
+    # validate format string
+    if not args['format']:
+        # set default format if not specified
+        if args['cube']:
+            args['lut_ext'] = 'cube'
+        else:
+            args['lut_ext'] = 'spi1d'
+        args['format'] = 'spi'
+    else:
+        formats = ['spi', 'cube', 'cub']
+        if args['format'] not in formats:
+            log.info('Warning: specified format {0} invalid. Using default format.'.format(args['format']))
+            args['format'] = 'spi'
+    
+    # validate image path, if one was given
+    if args['image']:
+        args['image'] = os.path.expanduser(args['image'])
+        args['image'] = os.path.realpath(args['image'])
+        if not os.path.isfile(args['image']):
+            log.error('Error: {0} - specified image path does not exist. Exiting...'.format(args['image']))
+            return None
+
+    # output image filepath
+    if not args['outdir']:
+        # set output filepath to current directory
+        args['outdir'] = os.path.realpath(os.getcwd())
+    else:
+        # create specified output directory if it does not exist
+        args['outdir'] = os.path.expanduser(args['outdir'])
+        args['outdir'] = os.path.realpath(args['outdir'])
+        if not os.path.isdir(args['outdir']):
+            os.makedirs(args['outdir'])
+    
+    # assemble output image name
+    if args['cube']:
+        out_image_name = 'identity_cube{0}.tif'.format(args['size'])
+    else:
+        out_image_name = 'identity_{0}_{1}_{2}.tif'.format(args['mn'], args['mx'], args['size'])
+    args['out_image'] = os.path.join(args['outdir'], out_image_name)
+    
+    # assemble output lut name, if input image was specified (otherwise we are generating an identity image)
+    if args['image']:
+        out_lut_name = os.path.splitext(os.path.basename(args['image']))[0]
+        args['out_lut_name'] = '{0}.{1}'.format(out_lut_name, args['lut_ext'])
+        args['out_lut_name'] = os.path.join(args['outdir'], args['out_lut_name'])
+    
+    return args
+
+
+def gen_image_1d(args):
+    ''' Generate a 1D identity LUT image
+    '''
+    log.info('Generating 1D Identity LUT Image: {0}'.format(args['out_image']))
+    im_out = np.linspace(args['mn'], args['mx'], args['size'], dtype=np.float32)
+    im_out = im_out[np.newaxis,:]
+    
+    return iio.imsave(args['out_image'], im_out)
+        
+
+def gen_lut_1d(args):
+    ''' Generate 1D LUT from processed image
+    '''
+    log.info('Generating 1D LUT: {0}'.format(args['out_lut_name']))
+    im_in = iio.imread(args['image'])
+    
+    # use first channel if more than one
+    if im_in.ndim > 2:
+        log.warning('Warning: 1D LUT image has {0} channels. Using the first...'.format(im_in.ndim))
+        im_in = im_in[:,:,0]
+    
+    header = 'Version 1\nFrom {0} {1}\nLength {2}\nComponents 1\n{{'.format(args['mn'], args['mx'], args['size'])
+    footer = '}'
+    
+    with open(args['out_lut_name'], 'w') as f:
+        np.savetxt(f, im_in, fmt='%1.8g', delimiter='\n', header=header, footer=footer, comments='')
+    return 
+        
+
+def gen_image_3d(args):
+    ''' Generate a 3D identity LUT image
+    '''
+    log.info('Generating 3D Identity LUT Image: {0}'.format(args['out_image']))
+    
+    # cube size
+    size = args['size']
+    mn, mx = (0.0, 1.0)
+    
+    # single size x size tile
+    im_tile = np.zeros((size, size, 3), dtype=np.float32)
+    
+    # x ramp in R, y ramp in B
+    ramp = np.linspace(mn, mx, size)
+    im_tile[:,:,0] = ramp[np.newaxis,:]
+    im_tile[:,:,2] = ramp[:,np.newaxis]
+    
+    # stack tiles horizontally, setting G=v
+    for i, v in enumerate(ramp):
+      im_tile[:,:,1] = np.ones((size, size), dtype=np.float32) * v
+      if i == 0:
+        im_out = im_tile.copy()
+      else:
+        im_out = np.hstack((im_out, im_tile))
+        
+    return iio.imsave(args['out_image'], im_out)
+
+
+def gen_lut_3d(args):
+    ''' Generate 3D LUT from processed image
+    '''
+    log.info('Generating 3D LUT: {0}'.format(args['out_lut_name']))
+    
+    im_in = iio.imread(args['image'])
+    if np.size(im_in, 2) > 3:
+        im_in = im_in[:, :, :3]
+        
+    vals = im_in.reshape(im_in.shape[0]*im_in.shape[1], im_in.shape[2])
+
+    header = 'LUT_3D_SIZE {0}'.format(args['size'])
+    footer = ''
+    
+    with open(args['out_lut_name'], 'w') as f:
+        np.savetxt(f, vals, fmt='%1.6g', delimiter=' ', header=header, footer=footer, comments='')
+    return 
+
+
+def start():
+    args = get_args()
+    if not args:
+        return
+    
+    if not args['image']:
+        # generate an identity lut
+        if args['cube']:
+            gen_image_3d(args)
+        else:
+            gen_image_1d(args)
+    else:
+        # generate lut from image
+        if args['cube']:
+            gen_lut_3d(args)
+        else:
+            gen_lut_1d(args)
+        
+
+if __name__=='__main__':
+    start()
